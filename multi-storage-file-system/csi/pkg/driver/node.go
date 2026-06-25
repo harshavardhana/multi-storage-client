@@ -44,6 +44,12 @@ const (
 	credentialModeIRSA   credentialMode = "irsa"
 )
 
+// Canonical backend types accepted in volumeAttributes.backendType.
+const (
+	backendTypeS3      = "S3"
+	backendTypeAIStore = "AIStore"
+)
+
 const (
 	// serviceAccountTokensVolCtxKey is the volume_context key the kubelet
 	// populates with the workload pod's projected ServiceAccount token(s) when
@@ -318,6 +324,20 @@ func resolveCredentialMode(volCtx, secrets map[string]string) (credentialMode, e
 	}
 }
 
+// resolveBackendType normalizes volumeAttributes.backendType to its canonical
+// form (backendTypeS3 or backendTypeAIStore), defaulting to S3. An unsupported
+// value is rejected so a misconfigured PV fails fast.
+func resolveBackendType(volCtx map[string]string) (string, error) {
+	switch strings.ToUpper(strings.TrimSpace(valOrDefault(volCtx, "backendType", backendTypeS3))) {
+	case "S3":
+		return backendTypeS3, nil
+	case "AISTORE":
+		return backendTypeAIStore, nil
+	default:
+		return "", fmt.Errorf("unsupported backendType %q (expected S3 or AIStore)", volCtx["backendType"])
+	}
+}
+
 // parseWorkloadToken extracts the projected ServiceAccount token for the given
 // audience from the kubelet-provided serviceAccount.tokens JSON in
 // volume_context (populated only when the CSIDriver declares tokenRequests).
@@ -351,16 +371,13 @@ func (ns *nodeServer) writeConfig(targetPath string, volCtx, secrets map[string]
 		return "", "", fmt.Errorf("failed to create temp config dir: %w", err)
 	}
 
-	backendType := strings.ToUpper(strings.TrimSpace(valOrDefault(volCtx, "backendType", "S3")))
-	if backendType != "S3" && backendType != "AISTORE" {
+	backendType, err := resolveBackendType(volCtx)
+	if err != nil {
 		os.RemoveAll(configDir)
-		return "", "", fmt.Errorf("unsupported backendType %q (expected S3 or AIStore)", volCtx["backendType"])
-	}
-	if backendType == "AISTORE" {
-		backendType = "AIStore"
+		return "", "", err
 	}
 	dirName := valOrDefault(volCtx, "dirName", strings.ToLower(backendType))
-	if backendType == "AIStore" && dirName == "aistore" {
+	if backendType == backendTypeAIStore && dirName == "aistore" {
 		dirName = "ais"
 	}
 
@@ -424,7 +441,7 @@ func (ns *nodeServer) writeConfig(targetPath string, volCtx, secrets map[string]
 	// placeholders with empty env vars would make the SDK think static creds
 	// were intended and fail with "missing credentials".
 	credentialBlock := ""
-	if backendType == "S3" && mode == credentialModeStatic {
+	if backendType == backendTypeS3 && mode == credentialModeStatic {
 		credentialBlock = `      access_key_id: "${AWS_ACCESS_KEY_ID}"
       secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
 `
@@ -432,13 +449,13 @@ func (ns *nodeServer) writeConfig(targetPath string, volCtx, secrets map[string]
 
 	var backendSpecific strings.Builder
 	switch backendType {
-	case "S3":
+	case backendTypeS3:
 		fmt.Fprintf(&backendSpecific, `    S3:
       region: %q
       endpoint: %q
 %s      virtual_hosted_style_request: false
 `, region, endpoint, credentialBlock)
-	case "AIStore":
+	case backendTypeAIStore:
 		aisOptionalQuoted := func(key, yamlField string) {
 			if v := volCtx[key]; v != "" {
 				fmt.Fprintf(&backendSpecific, "      %s: %q\n", yamlField, v)
@@ -485,11 +502,23 @@ mountpoint: %s
 // existing file in place (republish) is intentional: the AWS SDK re-reads the
 // token file when it refreshes credentials.
 //
-// It returns ("", "", nil) when per-workload IRSA does not apply — static mode
-// or no workload token in volume_context — so the caller keeps today's
-// driver-SA behavior.
+// It returns ("", "", nil) when per-workload IRSA does not apply — static mode,
+// a non-S3 backend, or no workload token in volume_context — so the caller keeps
+// today's driver-SA behavior.
 func (ns *nodeServer) resolveWorkloadIdentity(configDir string, volCtx map[string]string, mode credentialMode) (string, string, error) {
 	if mode == credentialModeStatic {
+		return "", "", nil
+	}
+	// Per-workload IRSA assumes an AWS IAM role, so it only applies to S3
+	// mounts. AIStore (and any future non-S3 backend) needs no AWS identity;
+	// without this guard a tokenRequests-enabled CSIDriver would hand every
+	// mount a workload token and force AIStore PVs to set a meaningless
+	// volumeAttributes.roleArn.
+	backendType, err := resolveBackendType(volCtx)
+	if err != nil {
+		return "", "", status.Error(codes.InvalidArgument, err.Error())
+	}
+	if backendType != backendTypeS3 {
 		return "", "", nil
 	}
 	token, ok, err := parseWorkloadToken(volCtx, stsAudience)

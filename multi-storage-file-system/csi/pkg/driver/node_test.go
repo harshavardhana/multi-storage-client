@@ -395,6 +395,28 @@ func TestResolveWorkloadIdentity_StaticModeIsNoop(t *testing.T) {
 	}
 }
 
+func TestResolveWorkloadIdentity_AIStoreBackendBypassesWorkloadIdentity(t *testing.T) {
+	ns := newNodeServer("node-test", "/usr/local/bin/msfs")
+	configDir := t.TempDir()
+	// On a tokenRequests-enabled CSIDriver the kubelet delivers a workload token
+	// for every mount, AIStore included. AIStore needs no AWS identity, so this
+	// must be a no-op and must NOT require volumeAttributes.roleArn.
+	volCtx := map[string]string{
+		"backendType":                 "AIStore",
+		serviceAccountTokensVolCtxKey: `{"sts.amazonaws.com":{"token":"workload-token-xyz"}}`,
+	}
+	tokenFile, roleArn, err := ns.resolveWorkloadIdentity(configDir, volCtx, credentialModeIRSA)
+	if err != nil {
+		t.Fatalf("AIStore must not require per-workload IRSA / roleArn; got error: %v", err)
+	}
+	if tokenFile != "" || roleArn != "" {
+		t.Fatalf("AIStore must bypass per-workload IRSA; got tokenFile=%q roleArn=%q", tokenFile, roleArn)
+	}
+	if _, statErr := os.Stat(filepath.Join(configDir, webIdentityTokenFileName)); !os.IsNotExist(statErr) {
+		t.Fatalf("no token file should be written for AIStore; stat err = %v", statErr)
+	}
+}
+
 // --- helpers -----------------------------------------------------------------
 
 func writeConfigOrFatal(t *testing.T, ns *nodeServer, volCtx, secrets map[string]string, mode credentialMode) (string, string) {
